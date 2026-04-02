@@ -1,8 +1,8 @@
-// PNGToolzRent Telegram Bot // Full integrated system with admin panel, slots, payments, sessions, and receipts forwarding
+// PNGToolzRent Telegram Bot (Slot Management Enabled)
 
 const express = require("express"); const TelegramBot = require("node-telegram-bot-api"); const admin = require("firebase-admin");
 
-// ================= EXPRESS (Render keep-alive) ================= const app = express(); const PORT = process.env.PORT || 3000;
+// ================= EXPRESS ================= const app = express(); const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => { res.send("PNGToolzRent Bot Running ✅"); });
 
@@ -12,17 +12,50 @@ app.listen(PORT, () => console.log("Server running on port", PORT));
 
 const ADMIN_ID = process.env.ADMIN_ID; const CHANNEL = "@ptr_records";
 
-// ================= BOT ================= const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+// ================= FIREBASE ================= admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
 
-// ================= FIREBASE ================= admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) }); const db = admin.firestore();
+const db = admin.firestore();
+
+// ================= BOT ================= const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 // ================= STATE ================= const userFlow = {}; const adminInput = {};
 
 // ================= HELPERS ================= const isAdmin = (id) => String(id) === String(ADMIN_ID);
 
-// ================= INIT DB (AUTO SEED) ================= async function initDB() { const toolsRef = db.collection("tools"); const snap = await toolsRef.get();
+// ================= INIT DB ================= async function initDB() { const toolsRef = db.collection("tools"); const snap = await toolsRef.get();
 
-if (snap.empty) { await toolsRef.doc("unlocktool").set({ name: "UnlockTool", maxSlots: 5, activeUsers: 0 }); console.log("Database seeded"); } } initDB();
+if (snap.empty) { await toolsRef.doc("unlocktool").set({ name: "UnlockTool", maxSlots: 5 }); console.log("Database seeded"); } } initDB();
+
+// ================= SLOT HELPERS ================= async function getToolStatus(toolId) { const toolDoc = await db.collection("tools").doc(toolId).get(); if (!toolDoc.exists) return null;
+
+const toolData = toolDoc.data();
+
+const bookingsSnap = await db.collection("bookings") .where("tool", "==", toolId) .where("status", "==", "active") .get();
+
+const activeCount = bookingsSnap.size; const maxSlots = toolData.maxSlots || 0;
+
+let nextAvailableIn = null;
+
+if (activeCount >= maxSlots) { let earliest = null;
+
+bookingsSnap.forEach(doc => {
+  const d = doc.data();
+  if (!earliest || d.expiresAt < earliest) {
+    earliest = d.expiresAt;
+  }
+});
+
+const now = Date.now();
+const diff = Math.max(0, earliest - now);
+
+const h = Math.floor(diff / 3600000);
+const m = Math.floor((diff % 3600000) / 60000);
+
+nextAvailableIn = `${h}h ${m}m`;
+
+}
+
+return { name: toolData.name, maxSlots, activeCount, available: activeCount < maxSlots, nextAvailableIn }; }
 
 // ================= START ================= bot.onText(//start/, async (msg) => { const userId = msg.from.id;
 
@@ -38,14 +71,23 @@ bot.sendMessage(chatId, "Main Menu", { reply_markup: { inline_keyboard: buttons 
 
 // ================= CALLBACK ================= bot.on("callback_query", async (q) => { const chatId = q.message.chat.id; const userId = q.from.id; const data = q.data;
 
-if (data === "admin" && isAdmin(userId)) { return bot.sendMessage(chatId, "Admin Panel", { reply_markup: { inline_keyboard: [ [{ text: "👥 Customers", callback_data: "customers" }], [{ text: "⏳ Active Sessions", callback_data: "sessions" }], [{ text: "⛔ Terminate Session", callback_data: "terminate" }] ] } }); }
-
-if (data === "rent") { const tools = await db.collection("tools").get();
+if (data === "rent") { const toolsSnap = await db.collection("tools").get();
 
 const buttons = [];
-tools.forEach(doc => {
-  buttons.push([{ text: doc.data().name, callback_data: `tool_${doc.id}` }]);
-});
+
+for (const doc of toolsSnap.docs) {
+  const status = await getToolStatus(doc.id);
+
+  if (!status) continue;
+
+  let label = `${status.name} (${status.activeCount}/${status.maxSlots})`;
+
+  if (!status.available) {
+    label += status.nextAvailableIn ? ` - Full (${status.nextAvailableIn})` : " - Full";
+  }
+
+  buttons.push([{ text: label, callback_data: `tool_${doc.id}` }]);
+}
 
 return bot.sendMessage(chatId, "Select Tool", {
   reply_markup: { inline_keyboard: buttons }
@@ -53,9 +95,15 @@ return bot.sendMessage(chatId, "Select Tool", {
 
 }
 
-if (data.startsWith("tool_")) { const toolId = data.replace("tool_", ""); userFlow[userId] = { toolId, step: "rate" };
+if (data.startsWith("tool_")) { const toolId = data.replace("tool_", ""); const status = await getToolStatus(toolId);
 
-return bot.sendMessage(chatId, "Select Rate (K10 = 6H, K18 = 12H)", {
+if (!status.available) {
+  return bot.sendMessage(chatId, `Tool is full. Next available in ${status.nextAvailableIn}`);
+}
+
+userFlow[userId] = { toolId, step: "rate" };
+
+return bot.sendMessage(chatId, "Select Rate", {
   reply_markup: {
     inline_keyboard: [
       [{ text: "6 Hours - K10", callback_data: "rate_6" }],
@@ -87,52 +135,9 @@ const details = method === "BSP"
 
 return bot.sendMessage(chatId, `Send receipt after payment:\n\n${details}`);
 
-}
+} });
 
-if (data === "customers" && isAdmin(userId)) { const snap = await db.collection("users").get(); let text = "Customers:\n\n";
-
-snap.forEach(doc => {
-  const d = doc.data();
-  text += `${d.username ? "@" + d.username : d.firstName} (${doc.id})\n`;
-});
-
-return bot.sendMessage(chatId, text);
-
-}
-
-if (data === "sessions" && isAdmin(userId)) { const snap = await db.collection("bookings").where("status", "==", "active").get();
-
-let text = "Active Sessions:\n\n";
-const now = Date.now();
-
-snap.forEach(doc => {
-  const d = doc.data();
-  const remaining = Math.max(0, d.expiresAt - now);
-  const h = Math.floor(remaining / 3600000);
-  const m = Math.floor((remaining % 3600000) / 60000);
-
-  text += `User: ${doc.id}\nTool: ${d.tool}\nRemaining: ${h}h ${m}m\n\n`;
-});
-
-return bot.sendMessage(chatId, text);
-
-}
-
-if (data === "terminate" && isAdmin(userId)) { adminInput[userId] = "terminate"; return bot.sendMessage(chatId, "Send user ID to terminate"); } });
-
-// ================= MESSAGE HANDLER ================= bot.on("message", async (msg) => { const userId = msg.from.id; const chatId = msg.chat.id;
-
-if (isAdmin(userId) && adminInput[userId] === "terminate") { const target = msg.text;
-
-await db.collection("bookings").doc(target).update({ status: "terminated" });
-
-bot.sendMessage(target, "Session terminated by admin");
-bot.sendMessage(chatId, "Terminated");
-
-delete adminInput[userId];
-return;
-
-}
+// ================= RECEIPT HANDLER ================= bot.on("message", async (msg) => { const userId = msg.from.id; const chatId = msg.chat.id;
 
 if (msg.photo && userFlow[userId]?.step === "receipt") { const fileId = msg.photo[msg.photo.length - 1].file_id; const flow = userFlow[userId];
 
@@ -181,13 +186,19 @@ await db.collection("bookings").doc(userId).update({
   expiresAt
 });
 
-bot.sendMessage(userId, "Approved. You will receive login details shortly.");
+bot.sendMessage(userId, "Approved. Your session is now active.");
 bot.sendMessage(chatId, "Approved");
+
 await bot.sendMessage(CHANNEL, `Approved User: ${userId}`);
 
 }
 
-if (data.startsWith("reject_")) { const userId = data.split("_")[1]; await db.collection("bookings").doc(userId).update({ status: "rejected" }); bot.sendMessage(userId, "Rejected"); bot.sendMessage(chatId, "Rejected"); } });
+if (data.startsWith("reject_")) { const userId = data.split("_")[1]; await db.collection("bookings").doc(userId).update({ status: "rejected" });
+
+bot.sendMessage(userId, "Rejected");
+bot.sendMessage(chatId, "Rejected");
+
+} });
 
 // ================= AUTO EXPIRY ================= setInterval(async () => { const snap = await db.collection("bookings").where("status", "==", "active").get(); const now = Date.now();
 
@@ -195,7 +206,7 @@ snap.forEach(async doc => { const d = doc.data();
 
 if (d.expiresAt && now > d.expiresAt) {
   await doc.ref.update({ status: "expired" });
-  bot.sendMessage(d.userId, "Session expired");
+  bot.sendMessage(d.userId, "Your session has expired.");
 }
 
 }); }, 60000);
