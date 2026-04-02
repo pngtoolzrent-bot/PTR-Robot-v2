@@ -1,290 +1,278 @@
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
+require("dotenv").config();
+const { Telegraf, Markup } = require("telegraf");
 const admin = require("firebase-admin");
+const dayjs = require("dayjs");
 
-// ================= EXPRESS =================
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get("/", (req, res) => res.send("Bot is running"));
-app.listen(PORT);
-
-// ================= ENV =================
+// ENV
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = String(process.env.ADMIN_ID);
-const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT;
+const ADMIN_ID = process.env.ADMIN_ID;
 
-if (!BOT_TOKEN || !ADMIN_ID || !FIREBASE_SERVICE_ACCOUNT) {
-  throw new Error("Missing ENV variables");
-}
+// Firebase init
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-// ================= FIREBASE =================
 admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_ACCOUNT))
+  credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
+const bot = new Telegraf(BOT_TOKEN);
 
-// ================= BOT =================
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// ---------------- INIT DATABASE ----------------
+async function initializeDatabase() {
+  const configRef = db.collection("system").doc("config");
+  const config = await configRef.get();
 
-// ================= CONSTANTS =================
-const CHANNEL = "@ptr_records";
+  if (config.exists && config.data().initialized) return;
 
-// ================= HELPERS =================
-const isAdmin = (id) => String(id) === ADMIN_ID;
+  const tools = [
+    { tool_id: "tool1", name: "UnlockTool", total_slots: 3 }
+  ];
 
-// ================= INIT DB (SELF-HEALING) =================
-async function ensureToolAndSlots() {
-  const toolRef = db.collection("tools").doc("unlocktool");
-  const toolDoc = await toolRef.get();
+  for (const tool of tools) {
+    await db.collection("tools").doc(tool.tool_id).set(tool);
 
-  if (!toolDoc.exists) {
-    await toolRef.set({ name: "UnlockTool" });
-    console.log("Tool created");
-  }
-
-  const slotsRef = toolRef.collection("slots");
-  const snap = await slotsRef.get();
-
-  if (snap.empty) {
-    console.log("Creating slots...");
-
-    for (let i = 1; i <= 5; i++) {
-      await slotsRef.doc(`slot${i}`).set({
-        userId: null,
-        expiresAt: null
+    for (let i = 1; i <= tool.total_slots; i++) {
+      await db.collection("slots").doc(`${tool.tool_id}_slot_${i}`).set({
+        tool_id: tool.tool_id,
+        slot_number: `SLOT ${i}`,
+        is_active: false,
+        assigned_to: null,
+        expires_at: null,
+        reserved_by: null,
+        reserved_until: null
       });
     }
-
-    console.log("Slots created");
   }
-}
-ensureToolAndSlots();
 
-// ================= SLOT HELPERS =================
-async function getSlots() {
-  const slotsSnap = await db
-    .collection("tools")
-    .doc("unlocktool")
-    .collection("slots")
+  await configRef.set({ initialized: true });
+  console.log("🔥 Database initialized");
+}
+
+// ---------------- HELPERS ----------------
+function formatTime(ms) {
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return `${h}h ${m}m`;
+}
+
+// ---------------- START ----------------
+bot.start(async (ctx) => {
+  const toolsSnap = await db.collection("tools").get();
+
+  const buttons = toolsSnap.docs.map(doc =>
+    [Markup.button.callback(doc.data().name, `tool_${doc.id}`)]
+  );
+
+  ctx.reply("Select a tool:", Markup.inlineKeyboard(buttons));
+});
+
+// ---------------- TOOL SELECT ----------------
+bot.action(/tool_(.+)/, async (ctx) => {
+  const tool_id = ctx.match[1];
+
+  const slotsSnap = await db.collection("slots")
+    .where("tool_id", "==", tool_id)
     .get();
 
-  const slots = [];
+  const available = [];
+  let earliest = null;
+
   slotsSnap.forEach(doc => {
-    slots.push({ id: doc.id, ...doc.data() });
-  });
+    const s = doc.data();
 
-  return slots;
-}
-
-async function findFreeSlot() {
-  const slots = await getSlots();
-  return slots.find(s => !s.userId) || null;
-}
-
-// ================= START =================
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  await db.collection("users").doc(String(userId)).set({
-    username: msg.from.username || null
-  }, { merge: true });
-
-  bot.sendMessage(chatId, "👋 Welcome to PNGToolzRent", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🛠 Rent Tool", callback_data: "rent" }],
-        isAdmin(userId) ? [{ text: "⚙️ Admin Panel", callback_data: "admin" }] : []
-      ]
-    }
-  });
-});
-
-// ================= CALLBACKS =================
-bot.on("callback_query", async (q) => {
-  const chatId = q.message.chat.id;
-  const userId = q.from.id;
-  const data = q.data;
-
-  bot.answerCallbackQuery(q.id);
-
-  // ===== RENT =====
-  if (data === "rent") {
-    const slot = await findFreeSlot();
-
-    if (!slot) {
-      return bot.sendMessage(chatId, "❌ No slots available.");
+    if (!s.is_active && (!s.reserved_until || s.reserved_until < Date.now())) {
+      available.push({ id: doc.id, ...s });
     }
 
-    await db.collection("requests").doc(String(userId)).set({
-      toolId: "unlocktool",
-      slotId: slot.id,
-      status: "pending"
-    });
-
-    return bot.sendMessage(chatId, "Select duration:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "6 Hours - K10", callback_data: "rate_6" }],
-          [{ text: "12 Hours - K18", callback_data: "rate_12" }]
-        ]
+    if (s.is_active && s.expires_at) {
+      if (!earliest || s.expires_at < earliest) {
+        earliest = s.expires_at;
       }
-    });
+    }
+  });
+
+  // CASE A: available
+  if (available.length > 0) {
+    const buttons = available.map(s =>
+      [Markup.button.callback(s.slot_number, `slot_${s.id}`)]
+    );
+
+    return ctx.reply("🟢 Available Slots:", Markup.inlineKeyboard(buttons));
   }
 
-  // ===== RATE =====
-  if (data.startsWith("rate_")) {
-    const hours = data === "rate_6" ? 6 : 12;
+  // CASE B: none available
+  if (earliest) {
+    const timeLeft = earliest - Date.now();
 
-    await db.collection("requests").doc(String(userId)).update({
-      rate: hours
-    });
-
-    return bot.sendMessage(chatId, "Select payment method:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🏦 BSP", callback_data: "pay_bsp" }],
-          [{ text: "📱 CellMoni", callback_data: "pay_cell" }]
-        ]
-      }
-    });
+    return ctx.reply(
+      `🔴 All slots busy\n⏳ Next free in: ${formatTime(timeLeft)}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("🔄 Refresh", `tool_${tool_id}`)]
+      ])
+    );
   }
 
-  // ===== PAYMENT =====
-  if (data === "pay_bsp" || data === "pay_cell") {
-    const method = data === "pay_bsp" ? "BSP" : "CellMoni";
-
-    await db.collection("requests").doc(String(userId)).update({
-      payment: method
-    });
-
-    const details =
-      method === "BSP"
-        ? "🏦 BSP Account: 0001196222\nSend receipt after payment."
-        : "📱 CellMoni Number: 74703925\nSend receipt after payment.";
-
-    return bot.sendMessage(chatId, details);
-  }
-
-  // ===== ADMIN PANEL =====
-  if (data === "admin") {
-    if (!isAdmin(userId)) return;
-
-    const slots = await getSlots();
-
-    const text = slots
-      .map(s => `${s.id}: ${s.userId ? `USED (${s.userId})` : "FREE"}`)
-      .join("\n");
-
-    return bot.sendMessage(chatId, `⚙️ Admin Panel\n\n${text}`, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🔄 Refresh", callback_data: "admin" }]
-        ]
-      }
-    });
-  }
-
-  // ===== APPROVE =====
-  if (data.startsWith("approve_")) {
-    if (!isAdmin(userId)) return;
-
-    const targetId = data.split("_")[1];
-
-    const reqDoc = await db.collection("requests").doc(targetId).get();
-    if (!reqDoc.exists) return;
-
-    const req = reqDoc.data();
-
-    const expiresAt = Date.now() + (req.rate * 3600000);
-
-    await db.collection("tools")
-      .doc(req.toolId)
-      .collection("slots")
-      .doc(req.slotId)
-      .update({
-        userId: targetId,
-        expiresAt
-      });
-
-    await db.collection("requests").doc(targetId).update({
-      status: "approved"
-    });
-
-    bot.sendMessage(targetId, "✅ Approved. Session active.");
-    bot.sendMessage(chatId, "Approved.");
-  }
-
-  // ===== REJECT =====
-  if (data.startsWith("reject_")) {
-    if (!isAdmin(userId)) return;
-
-    const targetId = data.split("_")[1];
-
-    await db.collection("requests").doc(targetId).update({
-      status: "rejected"
-    });
-
-    bot.sendMessage(targetId, "❌ Rejected.");
-  }
+  ctx.reply("No slots found.");
 });
 
-// ================= RECEIPTS =================
-bot.on("message", async (msg) => {
-  const userId = msg.from.id;
+// ---------------- SLOT SELECT ----------------
+bot.action(/slot_(.+)/, async (ctx) => {
+  const slotId = ctx.match[1];
+  const userId = ctx.from.id;
 
-  if (msg.photo) {
-    const fileId = msg.photo.pop().file_id;
+  const slotRef = db.collection("slots").doc(slotId);
 
-    const reqDoc = await db.collection("requests").doc(String(userId)).get();
-    if (!reqDoc.exists) return;
-
-    const req = reqDoc.data();
-
-    // Send to admin
-    bot.sendPhoto(ADMIN_ID, fileId, {
-      caption: `User: ${userId}`,
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Approve", callback_data: `approve_${userId}` }],
-          [{ text: "Reject", callback_data: `reject_${userId}` }]
-        ]
-      }
-    });
-
-    // Send to channel
-    try {
-      await bot.sendPhoto(CHANNEL, fileId, {
-        caption: `User: ${userId}\nTool: ${req.toolId}\nStatus: pending`
-      });
-    } catch {}
-
-    bot.sendMessage(msg.chat.id, "📩 Receipt received. Awaiting approval.");
-  }
-});
-
-// ================= AUTO EXPIRY =================
-setInterval(async () => {
-  const slotsSnap = await db
-    .collection("tools")
-    .doc("unlocktool")
-    .collection("slots")
-    .get();
-
-  slotsSnap.forEach(async (doc) => {
+  await db.runTransaction(async (t) => {
+    const doc = await t.get(slotRef);
     const data = doc.data();
 
-    if (data.userId && data.expiresAt && Date.now() > data.expiresAt) {
-      await doc.ref.update({
-        userId: null,
-        expiresAt: null
-      });
+    if (data.is_active) throw new Error("Slot taken");
 
-      try {
-        bot.sendMessage(data.userId, "⏳ Session expired.");
-      } catch {}
+    t.update(slotRef, {
+      reserved_by: userId,
+      reserved_until: Date.now() + 5 * 60 * 1000
+    });
+  });
+
+  ctx.reply(
+    "✅ Slot reserved (5 min)\nSelect duration:",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("6 Hours", `dur_${slotId}_6`)],
+      [Markup.button.callback("12 Hours", `dur_${slotId}_12`)]
+    ])
+  );
+});
+
+// ---------------- DURATION ----------------
+bot.action(/dur_(.+)_(\d+)/, async (ctx) => {
+  const slotId = ctx.match[1];
+  const duration = ctx.match[2];
+
+  ctx.reply(
+    "Choose payment:",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("BSP", `pay_${slotId}_${duration}_BSP`)],
+      [Markup.button.callback("CellMoni", `pay_${slotId}_${duration}_CELL`)]
+    ])
+  );
+});
+
+// ---------------- PAYMENT ----------------
+bot.action(/pay_(.+)_(\d+)_(.+)/, async (ctx) => {
+  const [_, slotId, duration, method] = ctx.match;
+
+  ctx.session = {
+    slotId,
+    duration,
+    method
+  };
+
+  ctx.reply("📸 Send payment receipt image");
+});
+
+// ---------------- RECEIVE RECEIPT ----------------
+bot.on("photo", async (ctx) => {
+  if (!ctx.session) return;
+
+  const fileId = ctx.message.photo.pop().file_id;
+  const user = ctx.from;
+
+  const orderRef = await db.collection("orders").add({
+    user_id: user.id,
+    username: user.username || "",
+    slot_id: ctx.session.slotId,
+    duration: ctx.session.duration,
+    payment_method: ctx.session.method,
+    receipt: fileId,
+    status: "pending",
+    created_at: Date.now()
+  });
+
+  await bot.telegram.sendMessage(
+    ADMIN_ID,
+    `📥 New Order\nUser: @${user.username}\nDuration: ${ctx.session.duration}h`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("✅ Approve", `approve_${orderRef.id}`)],
+      [Markup.button.callback("❌ Reject", `reject_${orderRef.id}`)]
+    ])
+  );
+
+  ctx.reply("⏳ Waiting for admin approval");
+  ctx.session = null;
+});
+
+// ---------------- APPROVE ----------------
+bot.action(/approve_(.+)/, async (ctx) => {
+  if (ctx.from.id != ADMIN_ID) return;
+
+  const orderId = ctx.match[1];
+  const orderRef = db.collection("orders").doc(orderId);
+  const order = (await orderRef.get()).data();
+
+  const slotRef = db.collection("slots").doc(order.slot_id);
+
+  await slotRef.update({
+    is_active: true,
+    assigned_to: order.user_id,
+    expires_at: Date.now() + order.duration * 3600000,
+    reserved_by: null,
+    reserved_until: null
+  });
+
+  await orderRef.update({ status: "approved" });
+
+  await bot.telegram.sendMessage(order.user_id,
+    "✅ Approved!\nAdmin will send login shortly.");
+
+  ctx.reply("Approved. Send login manually.");
+});
+
+// ---------------- REJECT ----------------
+bot.action(/reject_(.+)/, async (ctx) => {
+  if (ctx.from.id != ADMIN_ID) return;
+
+  const orderId = ctx.match[1];
+  const orderRef = db.collection("orders").doc(orderId);
+  const order = (await orderRef.get()).data();
+
+  await db.collection("slots").doc(order.slot_id).update({
+    reserved_by: null,
+    reserved_until: null
+  });
+
+  await orderRef.update({ status: "rejected" });
+
+  await bot.telegram.sendMessage(order.user_id,
+    "❌ Payment rejected");
+
+  ctx.reply("Rejected");
+});
+
+// ---------------- CLEANUP JOB ----------------
+setInterval(async () => {
+  const now = Date.now();
+
+  const snap = await db.collection("slots")
+    .where("is_active", "==", true)
+    .get();
+
+  snap.forEach(doc => {
+    const s = doc.data();
+
+    if (s.expires_at && s.expires_at < now) {
+      doc.ref.update({
+        is_active: false,
+        assigned_to: null,
+        expires_at: null
+      });
     }
   });
+
 }, 60000);
+
+// ---------------- START BOT ----------------
+(async () => {
+  await initializeDatabase();
+  bot.launch();
+  console.log("🤖 Bot running");
+})();
