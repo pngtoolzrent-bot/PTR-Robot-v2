@@ -6,38 +6,26 @@ const admin = require("firebase-admin");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => {
-  res.send("PNGToolzRent Bot Running ✅");
-});
-
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.get("/", (req, res) => res.send("Bot Running ✅"));
+app.listen(PORT);
 
 // ================= ENV =================
-if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing");
-if (!process.env.ADMIN_ID) throw new Error("ADMIN_ID missing");
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("FIREBASE_SERVICE_ACCOUNT missing");
-
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID);
 const CHANNEL = "@ptr_records";
 
-// ================= FIREBASE =================
-let db;
-
-try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-
-  db = admin.firestore();
-} catch (err) {
-  console.error("Firebase init failed:", err);
-  process.exit(1);
+if (!BOT_TOKEN || !ADMIN_ID || !process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("Missing ENV");
 }
 
+// ================= FIREBASE =================
+admin.initializeApp({
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+});
+const db = admin.firestore();
+
 // ================= BOT =================
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ================= STATE =================
 const userFlow = {};
@@ -47,66 +35,47 @@ const isAdmin = (id) => String(id) === ADMIN_ID;
 
 // ================= INIT DB =================
 async function initDB() {
-  try {
-    const toolsRef = db.collection("tools");
-    const snap = await toolsRef.get();
+  const toolRef = db.collection("tools").doc("unlocktool");
+  const doc = await toolRef.get();
 
-    if (snap.empty) {
-      await toolsRef.doc("unlocktool").set({
-        name: "UnlockTool",
-        maxSlots: 5
+  if (!doc.exists) {
+    await toolRef.set({ name: "UnlockTool" });
+
+    const slots = toolRef.collection("slots");
+
+    for (let i = 1; i <= 5; i++) {
+      await slots.doc(`slot${i}`).set({
+        userId: null,
+        expiresAt: null
       });
-
-      console.log("Database seeded");
     }
-  } catch (err) {
-    console.error("DB init error:", err);
+
+    console.log("Slots created");
   }
 }
-
 initDB();
 
-// ================= SLOT STATUS =================
-async function getToolStatus(toolId) {
-  const toolDoc = await db.collection("tools").doc(toolId).get();
-  if (!toolDoc.exists) return null;
+// ================= GET SLOTS =================
+async function getSlots(toolId) {
+  const snap = await db.collection("tools").doc(toolId).collection("slots").get();
 
-  const tool = toolDoc.data();
+  const slots = [];
+  snap.forEach(doc => {
+    slots.push({ id: doc.id, ...doc.data() });
+  });
 
-  const bookingsSnap = await db.collection("bookings")
-    .where("tool", "==", toolId)
-    .where("status", "==", "active")
-    .get();
+  return slots;
+}
 
-  const activeCount = bookingsSnap.size;
-  const maxSlots = tool.maxSlots || 0;
+// ================= FIND FREE SLOT =================
+async function findFreeSlot(toolId) {
+  const slots = await getSlots(toolId);
 
-  let nextAvailableIn = null;
-
-  if (activeCount >= maxSlots) {
-    let earliest = null;
-
-    bookingsSnap.forEach(doc => {
-      const d = doc.data();
-      if (!earliest || d.expiresAt < earliest) {
-        earliest = d.expiresAt;
-      }
-    });
-
-    const diff = earliest - Date.now();
-    const h = Math.floor(diff / 3600000);
-    const m = Math.floor((diff % 3600000) / 60000);
-
-    nextAvailableIn = `${h}h ${m}m`;
+  for (let slot of slots) {
+    if (!slot.userId) return slot;
   }
 
-  return {
-    name: tool.name,
-    maxSlots,
-    activeCount,
-    available: activeCount < maxSlots,
-    nextAvailableIn
-  };
+  return null;
 }
 
 // ================= START =================
@@ -114,29 +83,20 @@ bot.onText(/\/start/, async (msg) => {
   const userId = msg.from.id;
 
   await db.collection("users").doc(String(userId)).set({
-    username: msg.from.username || null,
-    firstName: msg.from.first_name || null
+    username: msg.from.username || null
   }, { merge: true });
 
-  showMainMenu(msg.chat.id, userId);
+  bot.sendMessage(msg.chat.id, "Welcome to PNGToolzRent", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🛠 Rent Tool", callback_data: "rent" }],
+        isAdmin(userId) ? [{ text: "⚙️ Admin", callback_data: "admin" }] : []
+      ]
+    }
+  });
 });
 
-// ================= MAIN MENU =================
-async function showMainMenu(chatId, userId) {
-  const buttons = [
-    [{ text: "🛠 Rent Tool", callback_data: "rent" }]
-  ];
-
-  if (isAdmin(userId)) {
-    buttons.push([{ text: "⚙️ Admin Panel", callback_data: "admin" }]);
-  }
-
-  bot.sendMessage(chatId, "Welcome to PNGToolzRent 👋", {
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
-
-// ================= CALLBACK ROUTER =================
+// ================= CALLBACK =================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
   const userId = q.from.id;
@@ -144,55 +104,17 @@ bot.on("callback_query", async (q) => {
 
   bot.answerCallbackQuery(q.id);
 
-  // ================= ADMIN PANEL =================
-  if (data === "admin") {
-    if (!isAdmin(userId)) return;
-
-    return bot.sendMessage(chatId, "⚙️ Admin Panel", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "👥 Customers", callback_data: "admin_customers" }],
-          [{ text: "⏳ Active Sessions", callback_data: "admin_sessions" }]
-        ]
-      }
-    });
-  }
-
-  // ================= RENT =================
+  // ===== RENT =====
   if (data === "rent") {
-    const toolsSnap = await db.collection("tools").get();
+    const freeSlot = await findFreeSlot("unlocktool");
 
-    const buttons = [];
-
-    for (const doc of toolsSnap.docs) {
-      const status = await getToolStatus(doc.id);
-
-      let label = `${status.name} (${status.activeCount}/${status.maxSlots})`;
-
-      if (!status.available) {
-        label += status.nextAvailableIn ? ` - Full (${status.nextAvailableIn})` : " - Full";
-      }
-
-      buttons.push([{ text: label, callback_data: `tool_${doc.id}` }]);
+    if (!freeSlot) {
+      return bot.sendMessage(chatId, "❌ All slots are full. Try later.");
     }
 
-    return bot.sendMessage(chatId, "Select Tool", {
-      reply_markup: { inline_keyboard: buttons }
-    });
-  }
+    userFlow[userId] = { toolId: "unlocktool", slotId: freeSlot.id };
 
-  // ================= TOOL =================
-  if (data.startsWith("tool_")) {
-    const toolId = data.replace("tool_", "");
-    const status = await getToolStatus(toolId);
-
-    if (!status.available) {
-      return bot.sendMessage(chatId, `❌ Full. Next available in ${status.nextAvailableIn}`);
-    }
-
-    userFlow[userId] = { toolId };
-
-    return bot.sendMessage(chatId, "Select Rate", {
+    return bot.sendMessage(chatId, "Choose Duration", {
       reply_markup: {
         inline_keyboard: [
           [{ text: "6 Hours - K10", callback_data: "rate_6" }],
@@ -202,14 +124,12 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ================= RATE =================
+  // ===== RATE =====
   if (data.startsWith("rate_")) {
-    if (!userFlow[userId]) return;
-
     const hours = data === "rate_6" ? 6 : 12;
     userFlow[userId].rate = hours;
 
-    return bot.sendMessage(chatId, "Choose Payment Method", {
+    return bot.sendMessage(chatId, "Select Payment Method", {
       reply_markup: {
         inline_keyboard: [
           [{ text: "🏦 BSP", callback_data: "pay_bsp" }],
@@ -219,81 +139,57 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ================= PAYMENT =================
+  // ===== PAYMENT =====
   if (data === "pay_bsp" || data === "pay_cell") {
-    if (!userFlow[userId]) return;
-
     const method = data === "pay_bsp" ? "BSP" : "CellMoni";
     userFlow[userId].payment = method;
 
-    const details =
-      method === "BSP"
-        ? "Account#: 0001196222"
-        : "Number: 74703925";
+    const details = method === "BSP"
+      ? "Account#: 0001196222"
+      : "Number: 74703925";
 
-    return bot.sendMessage(chatId, `Send receipt after payment:\n\n${details}`);
+    bot.sendMessage(chatId, `Send receipt:\n\n${details}`);
   }
 
-  // ================= ADMIN APPROVE =================
+  // ===== APPROVE =====
   if (data.startsWith("approve_")) {
     if (!isAdmin(userId)) return;
 
-    const targetUserId = data.split("_")[1];
-
-    const bookingDoc = await db.collection("bookings").doc(targetUserId).get();
-    const booking = bookingDoc.data();
-
-    if (!booking) return;
-
-    await db.collection("bookings").doc(targetUserId).update({
-      status: "active",
-      expiresAt: booking.expiresAt
-    });
-
-    bot.sendMessage(targetUserId, "✅ Approved! Session active.");
-    bot.sendMessage(chatId, "Approved");
-  }
-
-  // ================= ADMIN REJECT =================
-  if (data.startsWith("reject_")) {
-    if (!isAdmin(userId)) return;
-
-    const targetUserId = data.split("_")[1];
-
-    await db.collection("bookings").doc(targetUserId).update({
-      status: "rejected"
-    });
-
-    bot.sendMessage(targetUserId, "❌ Rejected.");
-    bot.sendMessage(chatId, "Rejected");
-  }
-});
-
-// ================= RECEIPT HANDLER =================
-bot.on("message", async (msg) => {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-
-  if (msg.photo && userFlow[userId]) {
-    const fileId = msg.photo[msg.photo.length - 1].file_id;
-    const flow = userFlow[userId];
+    const targetId = data.split("_")[1];
+    const flow = userFlow[targetId];
 
     const expiresAt = Date.now() + (flow.rate * 3600000);
 
-    await db.collection("bookings").doc(String(userId)).set({
-      userId,
-      tool: flow.toolId,
-      rate: flow.rate,
-      payment: flow.payment,
-      status: "pending",
-      expiresAt
-    });
+    await db.collection("tools")
+      .doc(flow.toolId)
+      .collection("slots")
+      .doc(flow.slotId)
+      .update({
+        userId: targetId,
+        expiresAt
+      });
 
-    const caption = `Receipt\nUser: ${userId}\nTool: ${flow.toolId}\nPayment: ${flow.payment}`;
+    bot.sendMessage(targetId, "✅ Approved. Session active.");
+  }
 
-    // send to admin
+  // ===== REJECT =====
+  if (data.startsWith("reject_")) {
+    if (!isAdmin(userId)) return;
+
+    const targetId = data.split("_")[1];
+    bot.sendMessage(targetId, "❌ Rejected.");
+  }
+});
+
+// ================= RECEIPT =================
+bot.on("message", async (msg) => {
+  const userId = msg.from.id;
+
+  if (msg.photo && userFlow[userId]) {
+    const fileId = msg.photo.pop().file_id;
+
     bot.sendPhoto(ADMIN_ID, fileId, {
-      caption,
+      caption: `User: ${userId}`,
       reply_markup: {
         inline_keyboard: [
           [{ text: "Approve", callback_data: `approve_${userId}` }],
@@ -302,35 +198,32 @@ bot.on("message", async (msg) => {
       }
     });
 
-    // send to channel
     try {
-      await bot.sendPhoto(CHANNEL, fileId, { caption });
-    } catch (e) {}
+      await bot.sendPhoto(CHANNEL, fileId);
+    } catch {}
 
-    bot.sendMessage(chatId, "Receipt received. Await admin approval.");
-
-    delete userFlow[userId];
+    bot.sendMessage(msg.chat.id, "Waiting for approval...");
   }
 });
 
 // ================= AUTO EXPIRY =================
 setInterval(async () => {
-  try {
-    const snap = await db.collection("bookings")
-      .where("status", "==", "active")
-      .get();
+  const tools = await db.collection("tools").get();
 
-    const now = Date.now();
+  tools.forEach(async toolDoc => {
+    const slots = await toolDoc.ref.collection("slots").get();
 
-    snap.forEach(async doc => {
-      const d = doc.data();
+    slots.forEach(async slotDoc => {
+      const slot = slotDoc.data();
 
-      if (d.expiresAt && now > d.expiresAt) {
-        await doc.ref.update({ status: "expired" });
-        bot.sendMessage(d.userId, "⏳ Session expired.");
+      if (slot.userId && slot.expiresAt && Date.now() > slot.expiresAt) {
+        await slotDoc.ref.update({
+          userId: null,
+          expiresAt: null
+        });
+
+        bot.sendMessage(slot.userId, "⏳ Session expired.");
       }
     });
-  } catch (err) {
-    console.error(err);
-  }
+  });
 }, 60000);
