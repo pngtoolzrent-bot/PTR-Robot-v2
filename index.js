@@ -2,33 +2,34 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const admin = require("firebase-admin");
 
-// ================= EXPRESS =================
+// ================= EXPRESS (Render fix) =================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => res.send("Bot Running ✅"));
+app.get("/", (req, res) => res.send("Bot is running"));
 app.listen(PORT);
 
 // ================= ENV =================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID);
-const CHANNEL = "@ptr_records";
+const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT;
 
-if (!BOT_TOKEN || !ADMIN_ID || !process.env.FIREBASE_SERVICE_ACCOUNT) {
-  throw new Error("Missing ENV");
+if (!BOT_TOKEN || !ADMIN_ID || !FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("Missing ENV variables");
 }
 
 // ================= FIREBASE =================
 admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+  credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_ACCOUNT))
 });
+
 const db = admin.firestore();
 
 // ================= BOT =================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ================= STATE =================
-const userFlow = {};
+// ================= CONSTANTS =================
+const CHANNEL = "@ptr_records";
 
 // ================= HELPERS =================
 const isAdmin = (id) => String(id) === ADMIN_ID;
@@ -50,47 +51,39 @@ async function initDB() {
       });
     }
 
-    console.log("Slots created");
+    console.log("DB initialized");
   }
 }
 initDB();
 
 // ================= GET SLOTS =================
-async function getSlots(toolId) {
-  const snap = await db.collection("tools").doc(toolId).collection("slots").get();
-
+async function getSlots() {
+  const snap = await db.collection("tools").doc("unlocktool").collection("slots").get();
   const slots = [];
-  snap.forEach(doc => {
-    slots.push({ id: doc.id, ...doc.data() });
-  });
-
+  snap.forEach(d => slots.push({ id: d.id, ...d.data() }));
   return slots;
 }
 
 // ================= FIND FREE SLOT =================
-async function findFreeSlot(toolId) {
-  const slots = await getSlots(toolId);
-
-  for (let slot of slots) {
-    if (!slot.userId) return slot;
-  }
-
-  return null;
+async function findFreeSlot() {
+  const slots = await getSlots();
+  return slots.find(s => !s.userId) || null;
 }
 
 // ================= START =================
 bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
   const userId = msg.from.id;
 
   await db.collection("users").doc(String(userId)).set({
     username: msg.from.username || null
   }, { merge: true });
 
-  bot.sendMessage(msg.chat.id, "Welcome to PNGToolzRent", {
+  bot.sendMessage(chatId, "👋 Welcome to PNGToolzRent", {
     reply_markup: {
       inline_keyboard: [
         [{ text: "🛠 Rent Tool", callback_data: "rent" }],
-        isAdmin(userId) ? [{ text: "⚙️ Admin", callback_data: "admin" }] : []
+        isAdmin(userId) ? [{ text: "⚙️ Admin Panel", callback_data: "admin" }] : []
       ]
     }
   });
@@ -104,17 +97,21 @@ bot.on("callback_query", async (q) => {
 
   bot.answerCallbackQuery(q.id);
 
-  // ===== RENT =====
+  // ================= RENT =================
   if (data === "rent") {
-    const freeSlot = await findFreeSlot("unlocktool");
+    const slot = await findFreeSlot();
 
-    if (!freeSlot) {
-      return bot.sendMessage(chatId, "❌ All slots are full. Try later.");
+    if (!slot) {
+      return bot.sendMessage(chatId, "❌ No slots available right now.");
     }
 
-    userFlow[userId] = { toolId: "unlocktool", slotId: freeSlot.id };
+    await db.collection("requests").doc(String(userId)).set({
+      toolId: "unlocktool",
+      slotId: slot.id,
+      status: "pending"
+    });
 
-    return bot.sendMessage(chatId, "Choose Duration", {
+    return bot.sendMessage(chatId, "Choose duration:", {
       reply_markup: {
         inline_keyboard: [
           [{ text: "6 Hours - K10", callback_data: "rate_6" }],
@@ -124,12 +121,15 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ===== RATE =====
+  // ================= RATE =================
   if (data.startsWith("rate_")) {
     const hours = data === "rate_6" ? 6 : 12;
-    userFlow[userId].rate = hours;
 
-    return bot.sendMessage(chatId, "Select Payment Method", {
+    await db.collection("requests").doc(String(userId)).update({
+      rate: hours
+    });
+
+    return bot.sendMessage(chatId, "Choose payment method:", {
       reply_markup: {
         inline_keyboard: [
           [{ text: "🏦 BSP", callback_data: "pay_bsp" }],
@@ -139,55 +139,98 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ===== PAYMENT =====
+  // ================= PAYMENT =================
   if (data === "pay_bsp" || data === "pay_cell") {
     const method = data === "pay_bsp" ? "BSP" : "CellMoni";
-    userFlow[userId].payment = method;
 
-    const details = method === "BSP"
-      ? "Account#: 0001196222"
-      : "Number: 74703925";
+    await db.collection("requests").doc(String(userId)).update({
+      payment: method
+    });
 
-    bot.sendMessage(chatId, `Send receipt:\n\n${details}`);
+    const details =
+      method === "BSP"
+        ? "🏦 BSP Account: 0001196222\nSend receipt after payment."
+        : "📱 CellMoni Number: 74703925\nSend receipt after payment.";
+
+    return bot.sendMessage(chatId, details);
   }
 
-  // ===== APPROVE =====
+  // ================= ADMIN PANEL =================
+  if (data === "admin") {
+    if (!isAdmin(userId)) return;
+
+    const slots = await getSlots();
+
+    const text = slots.map(s =>
+      `${s.id} - ${s.userId ? `USED (${s.userId})` : "FREE"}`
+    ).join("\n");
+
+    return bot.sendMessage(chatId, `⚙️ Admin Panel\n\n${text}`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔄 Refresh", callback_data: "admin" }]
+        ]
+      }
+    });
+  }
+
+  // ================= APPROVE =================
   if (data.startsWith("approve_")) {
     if (!isAdmin(userId)) return;
 
     const targetId = data.split("_")[1];
-    const flow = userFlow[targetId];
 
-    const expiresAt = Date.now() + (flow.rate * 3600000);
+    const reqDoc = await db.collection("requests").doc(targetId).get();
+    if (!reqDoc.exists) return;
+
+    const req = reqDoc.data();
+
+    const expiresAt = Date.now() + (req.rate * 3600000);
 
     await db.collection("tools")
-      .doc(flow.toolId)
+      .doc(req.toolId)
       .collection("slots")
-      .doc(flow.slotId)
+      .doc(req.slotId)
       .update({
         userId: targetId,
         expiresAt
       });
 
-    bot.sendMessage(targetId, "✅ Approved. Session active.");
+    await db.collection("requests").doc(targetId).update({
+      status: "approved"
+    });
+
+    bot.sendMessage(targetId, "✅ Approved. Your session is active.");
+    bot.sendMessage(chatId, "Approved.");
   }
 
-  // ===== REJECT =====
+  // ================= REJECT =================
   if (data.startsWith("reject_")) {
     if (!isAdmin(userId)) return;
 
     const targetId = data.split("_")[1];
-    bot.sendMessage(targetId, "❌ Rejected.");
+
+    await db.collection("requests").doc(targetId).update({
+      status: "rejected"
+    });
+
+    bot.sendMessage(targetId, "❌ Payment rejected.");
   }
 });
 
-// ================= RECEIPT =================
+// ================= RECEIPTS =================
 bot.on("message", async (msg) => {
   const userId = msg.from.id;
 
-  if (msg.photo && userFlow[userId]) {
+  if (msg.photo) {
     const fileId = msg.photo.pop().file_id;
 
+    const reqDoc = await db.collection("requests").doc(String(userId)).get();
+    if (!reqDoc.exists) return;
+
+    const req = reqDoc.data();
+
+    // forward to admin
     bot.sendPhoto(ADMIN_ID, fileId, {
       caption: `User: ${userId}`,
       reply_markup: {
@@ -198,32 +241,33 @@ bot.on("message", async (msg) => {
       }
     });
 
+    // forward to record channel
     try {
-      await bot.sendPhoto(CHANNEL, fileId);
-    } catch {}
+      await bot.sendPhoto(CHANNEL, fileId, {
+        caption: `User: ${userId}\nTool: ${req.toolId}\nStatus: pending`
+      });
+    } catch (e) {}
 
-    bot.sendMessage(msg.chat.id, "Waiting for approval...");
+    bot.sendMessage(msg.chat.id, "📩 Receipt received. Waiting for admin approval.");
   }
 });
 
 // ================= AUTO EXPIRY =================
 setInterval(async () => {
-  const tools = await db.collection("tools").get();
+  const slotsSnap = await db.collection("tools").doc("unlocktool").collection("slots").get();
 
-  tools.forEach(async toolDoc => {
-    const slots = await toolDoc.ref.collection("slots").get();
+  slotsSnap.forEach(async (doc) => {
+    const data = doc.data();
 
-    slots.forEach(async slotDoc => {
-      const slot = slotDoc.data();
+    if (data.userId && data.expiresAt && Date.now() > data.expiresAt) {
+      await doc.ref.update({
+        userId: null,
+        expiresAt: null
+      });
 
-      if (slot.userId && slot.expiresAt && Date.now() > slot.expiresAt) {
-        await slotDoc.ref.update({
-          userId: null,
-          expiresAt: null
-        });
-
-        bot.sendMessage(slot.userId, "⏳ Session expired.");
-      }
-    });
+      try {
+        bot.sendMessage(data.userId, "⏳ Your session has expired.");
+      } catch {}
+    }
   });
 }, 60000);
