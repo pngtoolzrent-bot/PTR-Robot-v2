@@ -1,13 +1,30 @@
+const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const admin = require("firebase-admin");
 
-// ================= ENV =================
+// ================= EXPRESS (RENDER FIX) =================
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.send("PNGToolzRent Bot is running ✅");
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// ================= ENV CHECK =================
 if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing");
 if (!process.env.ADMIN_ID) throw new Error("ADMIN_ID missing");
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("FIREBASE_SERVICE_ACCOUNT missing");
 
+// ================= BOT =================
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
+const ADMIN_ID = process.env.ADMIN_ID;
+
+// ================= FIREBASE =================
 admin.initializeApp({
   credential: admin.credential.cert(
     JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
@@ -15,8 +32,6 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
-
-const ADMIN_ID = process.env.ADMIN_ID;
 
 // ================= STATE =================
 const userStates = {};
@@ -31,7 +46,6 @@ bot.onText(/\/start/, async (msg) => {
     id: userId,
     username: msg.from.username || null,
     firstName: msg.from.first_name || null,
-    lastName: msg.from.last_name || null,
     joinedAt: Date.now()
   }, { merge: true });
 
@@ -106,10 +120,7 @@ bot.on("callback_query", async (query) => {
 
     snap.forEach(doc => {
       const d = doc.data();
-
-      const username = d.username
-        ? `@${d.username}`
-        : d.firstName || "NoUsername";
+      const username = d.username ? `@${d.username}` : (d.firstName || "NoUsername");
 
       text += `👤 ${username}\n🆔 ${doc.id}\n\n`;
     });
@@ -208,7 +219,6 @@ bot.on("message", async (msg) => {
   if (isAdmin && pendingInputs[userId]) {
     const action = pendingInputs[userId];
 
-    // ADD TOOL
     if (action === "add_tool") {
       const id = msg.text.toLowerCase();
 
@@ -221,7 +231,6 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // REMOVE TOOL
     if (action === "remove_tool") {
       await db.collection("tools").doc(msg.text).delete();
 
@@ -230,7 +239,6 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // LOGIN DETAILS AFTER APPROVAL
     if (action.startsWith("login_")) {
       const targetUser = action.split("_")[1];
 
@@ -317,7 +325,7 @@ Status: Pending`;
   }
 });
 
-// ================= EXPIRY TIMER =================
+// ================= EXPIRY =================
 setInterval(async () => {
   const snap = await db.collection("bookings")
     .where("status", "==", "active")
