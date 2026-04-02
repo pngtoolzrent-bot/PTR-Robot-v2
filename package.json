@@ -1,5 +1,5 @@
 {
-  "name": "telegram-bot",
+  "name": "telegram-firebase-bot",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
