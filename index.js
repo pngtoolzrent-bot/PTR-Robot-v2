@@ -5,7 +5,7 @@ const admin = require("firebase-admin");
 // ================= ENV =================
 const TOKEN = process.env.BOT_TOKEN;
 const FIREBASE_KEY = process.env.FIREBASE_KEY;
-const ADMIN_ID = 8155108761;
+const ADMIN_ID = "8155108761";
 
 if (!TOKEN || !FIREBASE_KEY) {
   console.error("Missing env variables");
@@ -31,6 +31,19 @@ app.listen(process.env.PORT || 3000);
 // ================= MEMORY =================
 let pendingLoginInput = {};
 
+// ================= MENU =================
+function getMainMenu() {
+  return {
+    reply_markup: {
+      keyboard: [
+        ["🛠 Select Tool"],
+        ["⏳ Check Time"]
+      ],
+      resize_keyboard: true
+    }
+  };
+}
+
 // ================= BOOTSTRAP =================
 async function bootstrap() {
   const toolRef = db.collection("tools").doc("unlocktool");
@@ -41,7 +54,7 @@ async function bootstrap() {
       name: "UnlockTool",
       emoji: "🔓",
       active: true,
-      durationHours: 24
+      durationHours: 6
     });
   }
 
@@ -54,50 +67,177 @@ async function bootstrap() {
       await db.collection("slots").doc(`unlock_slot${i}`).set({
         tool: "unlocktool",
         status: "available",
-        bookedBy: null
+        bookedBy: null,
+        expiresAt: null
       });
     }
   }
 
   console.log("Database ready");
 }
-
 bootstrap();
 
 // ================= START =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  const userId = String(msg.from.id);
 
-  await db.collection("users").doc(String(userId)).set({
+  await db.collection("users").doc(userId).set({
     username: msg.from.username || null,
     firstSeen: Date.now()
   }, { merge: true });
 
-  const toolsSnap = await db.collection("tools")
-    .where("active", "==", true)
-    .get();
+  bot.sendMessage(chatId,
+`👋 Welcome to PNGToolzRent
 
-  const buttons = [];
+We appreciate you choosing our service 🙌
 
-  toolsSnap.forEach(doc => {
-    const t = doc.data();
+💰 Pricing:
+K10 = 6 Hours Access
 
-    buttons.push([{
-      text: `${t.emoji} ${t.name}`,
-      callback_data: `tool_${doc.id}`
-    }]);
-  });
+Use the buttons below to continue.`,
+    getMainMenu()
+  );
+});
 
-  bot.sendMessage(chatId, "🛠 Select a tool:", {
-    reply_markup: { inline_keyboard: buttons }
-  });
+// ================= MESSAGE HANDLER =================
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = String(msg.from.id);
+
+  if (msg.text && msg.text.startsWith("/")) return;
+
+  // 🛠 SELECT TOOL BUTTON
+  if (msg.text === "🛠 Select Tool") {
+
+    const toolsSnap = await db.collection("tools")
+      .where("active", "==", true)
+      .get();
+
+    const buttons = [];
+
+    toolsSnap.forEach(doc => {
+      const t = doc.data();
+      buttons.push([{
+        text: `${t.emoji} ${t.name}`,
+        callback_data: `tool_${doc.id}`
+      }]);
+    });
+
+    bot.sendMessage(chatId, "🛠 Select a tool:", {
+      reply_markup: { inline_keyboard: buttons }
+    });
+
+    return;
+  }
+
+  // ⏳ CHECK TIME BUTTON
+  if (msg.text === "⏳ Check Time") {
+
+    const bookingRef = db.collection("bookings").doc(userId);
+    const bookingDoc = await bookingRef.get();
+
+    if (!bookingDoc.exists) {
+      bot.sendMessage(chatId, "❌ You have no active session.");
+      return;
+    }
+
+    const data = bookingDoc.data();
+
+    if (data.status !== "active" || !data.expiresAt) {
+      bot.sendMessage(chatId, "⏳ No active time running.");
+      return;
+    }
+
+    const now = Date.now();
+    const remaining = data.expiresAt - now;
+
+    if (remaining <= 0) {
+      bot.sendMessage(chatId, "⏰ Your session has expired.");
+      return;
+    }
+
+    const hours = Math.floor(remaining / (1000 * 60 * 60));
+    const minutes = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+
+    bot.sendMessage(chatId, `⏳ Time Remaining: ${hours}h ${minutes}m`);
+
+    return;
+  }
+
+  // 📩 RECEIPT HANDLING
+  const bookingRef = db.collection("bookings").doc(userId);
+  const booking = await bookingRef.get();
+
+  if (!booking.exists) return;
+
+  if (msg.photo || msg.document) {
+    const fileId = msg.photo
+      ? msg.photo[msg.photo.length - 1].file_id
+      : msg.document.file_id;
+
+    await bookingRef.update({
+      receiptFileId: fileId
+    });
+
+    bot.sendMessage(chatId, "✅ Receipt received. Please wait for approval.");
+
+    bot.sendPhoto(ADMIN_ID, fileId, {
+      caption: `Receipt from ${userId}`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Approve", callback_data: `approve_${userId}` },
+            { text: "❌ Reject", callback_data: `reject_${userId}` }
+          ]
+        ]
+      }
+    });
+  }
+
+  // ADMIN SEND LOGIN
+  if (userId === ADMIN_ID && pendingLoginInput[ADMIN_ID]) {
+
+    const targetUser = pendingLoginInput[ADMIN_ID];
+    const bookingRef = db.collection("bookings").doc(targetUser);
+    const bookingDoc = await bookingRef.get();
+
+    if (bookingDoc.exists) {
+      const slotId = bookingDoc.data().slot;
+
+      const durationHours = 6;
+      const expiresAt = Date.now() + (durationHours * 60 * 60 * 1000);
+
+      await bookingRef.update({
+        status: "active",
+        expiresAt: expiresAt
+      });
+
+      await db.collection("slots").doc(slotId).update({
+        expiresAt: expiresAt
+      });
+
+      bot.sendMessage(targetUser,
+`🔐 Login Details:
+
+${msg.text}
+
+⏳ Access Time: 6 Hours
+
+Thank you for using PNGToolzRent 🙌`
+      );
+
+      bot.sendMessage(ADMIN_ID, "✅ Login sent & timer started");
+
+      delete pendingLoginInput[ADMIN_ID];
+    }
+  }
 });
 
 // ================= CALLBACK =================
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
-  const userId = query.from.id;
+  const userId = String(query.from.id);
   const data = query.data;
 
   // TOOL SELECT
@@ -111,9 +251,7 @@ bot.on("callback_query", async (query) => {
     const buttons = [];
 
     slotsSnap.forEach(doc => {
-      const slot = doc.data();
-
-      if (slot.status === "available") {
+      if (doc.data().status === "available") {
         buttons.push([{
           text: `Slot ${doc.id} ✅`,
           callback_data: `slot_${doc.id}`
@@ -143,8 +281,8 @@ bot.on("callback_query", async (query) => {
       bookedBy: userId
     });
 
-    await db.collection("bookings").doc(String(userId)).set({
-      tool: slotDoc.data().tool,
+    await db.collection("bookings").doc(userId).set({
+      userId: userId,
       slot: slotId,
       status: "pending",
       createdAt: Date.now()
@@ -154,7 +292,7 @@ bot.on("callback_query", async (query) => {
 
     bot.sendMessage(
       ADMIN_ID,
-      `📥 New Booking\nUser: ${userId}\nSlot: ${slotId}`,
+      `📥 Booking Request\nUser: ${userId}\nSlot: ${slotId}`,
       {
         reply_markup: {
           inline_keyboard: [
@@ -168,7 +306,7 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ADMIN APPROVE
+  // APPROVE
   if (data.startsWith("approve_") && userId === ADMIN_ID) {
     const targetUser = data.split("_")[1];
 
@@ -178,7 +316,7 @@ bot.on("callback_query", async (query) => {
     bot.sendMessage(targetUser, "✅ Approved. Waiting for login...");
   }
 
-  // ADMIN REJECT
+  // REJECT
   if (data.startsWith("reject_") && userId === ADMIN_ID) {
     const targetUser = data.split("_")[1];
 
@@ -189,7 +327,8 @@ bot.on("callback_query", async (query) => {
 
       await db.collection("slots").doc(slotId).update({
         status: "available",
-        bookedBy: null
+        bookedBy: null,
+        expiresAt: null
       });
 
       await db.collection("bookings").doc(targetUser).update({
@@ -197,60 +336,39 @@ bot.on("callback_query", async (query) => {
       });
     }
 
-    bot.sendMessage(targetUser, "❌ Rejected");
+    bot.sendMessage(targetUser, "❌ Booking rejected");
   }
 });
 
-// ================= RECEIPT =================
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
+// ================= AUTO EXPIRY =================
+setInterval(async () => {
+  const now = Date.now();
 
-  if (msg.text && msg.text.startsWith("/")) return;
+  const snapshot = await db.collection("bookings")
+    .where("status", "==", "active")
+    .get();
 
-  const bookingRef = db.collection("bookings").doc(String(userId));
-  const booking = await bookingRef.get();
+  snapshot.forEach(async (doc) => {
+    const data = doc.data();
 
-  if (!booking.exists) return;
+    if (data.expiresAt && now >= data.expiresAt) {
 
-  if (msg.photo || msg.document) {
-    const fileId = msg.photo
-      ? msg.photo[msg.photo.length - 1].file_id
-      : msg.document.file_id;
+      const slotId = data.slot;
 
-    await bookingRef.update({
-      receiptFileId: fileId
-    });
+      await doc.ref.update({ status: "expired" });
 
-    bot.sendMessage(chatId, "✅ Receipt received. Waiting for approval.");
+      await db.collection("slots").doc(slotId).update({
+        status: "available",
+        bookedBy: null,
+        expiresAt: null
+      });
 
-    bot.sendPhoto(ADMIN_ID, fileId, {
-      caption: `Receipt from ${userId}`,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Approve", callback_data: `approve_${userId}` },
-            { text: "❌ Reject", callback_data: `reject_${userId}` }
-          ]
-        ]
-      }
-    });
-  }
+      bot.sendMessage(data.userId, "⏰ Your time has expired. Slot released.");
 
-  // ADMIN LOGIN INPUT
-  if (userId === ADMIN_ID && pendingLoginInput[ADMIN_ID]) {
-    const targetUser = pendingLoginInput[ADMIN_ID];
+      console.log(`Expired: ${doc.id}`);
+    }
+  });
 
-    bot.sendMessage(targetUser, `🔐 Login Details:\n\n${msg.text}`);
-    bot.sendMessage(ADMIN_ID, "✅ Sent");
+}, 60000);
 
-    delete pendingLoginInput[ADMIN_ID];
-
-    await db.collection("bookings").doc(targetUser).update({
-      status: "active",
-      expiresAt: Date.now() + (24 * 60 * 60 * 1000)
-    });
-  }
-});
-
-console.log("Bot running...");
+console.log("🚀 PNGToolzRent Bot Running...");
