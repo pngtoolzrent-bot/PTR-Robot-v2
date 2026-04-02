@@ -1,9 +1,8 @@
-// ================= IMPORTS =================
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const admin = require("firebase-admin");
 
-// ================= EXPRESS KEEP ALIVE =================
+// ================= EXPRESS =================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -21,7 +20,7 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("FIREBASE_SERVICE_ACC
 const ADMIN_ID = String(process.env.ADMIN_ID);
 const CHANNEL = "@ptr_records";
 
-// ================= FIREBASE INIT =================
+// ================= FIREBASE =================
 let db;
 
 try {
@@ -67,7 +66,7 @@ async function initDB() {
 
 initDB();
 
-// ================= SLOT CHECK =================
+// ================= SLOT STATUS =================
 async function getToolStatus(toolId) {
   const toolDoc = await db.collection("tools").doc(toolId).get();
   if (!toolDoc.exists) return null;
@@ -137,13 +136,29 @@ async function showMainMenu(chatId, userId) {
   });
 }
 
-// ================= CALLBACK =================
+// ================= CALLBACK ROUTER =================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
   const userId = q.from.id;
   const data = q.data;
 
-  // ===== RENT =====
+  bot.answerCallbackQuery(q.id);
+
+  // ================= ADMIN PANEL =================
+  if (data === "admin") {
+    if (!isAdmin(userId)) return;
+
+    return bot.sendMessage(chatId, "⚙️ Admin Panel", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "👥 Customers", callback_data: "admin_customers" }],
+          [{ text: "⏳ Active Sessions", callback_data: "admin_sessions" }]
+        ]
+      }
+    });
+  }
+
+  // ================= RENT =================
   if (data === "rent") {
     const toolsSnap = await db.collection("tools").get();
 
@@ -151,7 +166,6 @@ bot.on("callback_query", async (q) => {
 
     for (const doc of toolsSnap.docs) {
       const status = await getToolStatus(doc.id);
-      if (!status) continue;
 
       let label = `${status.name} (${status.activeCount}/${status.maxSlots})`;
 
@@ -167,13 +181,13 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ===== TOOL SELECT =====
+  // ================= TOOL =================
   if (data.startsWith("tool_")) {
     const toolId = data.replace("tool_", "");
     const status = await getToolStatus(toolId);
 
     if (!status.available) {
-      return bot.sendMessage(chatId, `Tool is full. Next available in ${status.nextAvailableIn}`);
+      return bot.sendMessage(chatId, `❌ Full. Next available in ${status.nextAvailableIn}`);
     }
 
     userFlow[userId] = { toolId };
@@ -188,8 +202,10 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ===== RATE =====
+  // ================= RATE =================
   if (data.startsWith("rate_")) {
+    if (!userFlow[userId]) return;
+
     const hours = data === "rate_6" ? 6 : 12;
     userFlow[userId].rate = hours;
 
@@ -203,20 +219,57 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ===== PAYMENT =====
+  // ================= PAYMENT =================
   if (data === "pay_bsp" || data === "pay_cell") {
+    if (!userFlow[userId]) return;
+
     const method = data === "pay_bsp" ? "BSP" : "CellMoni";
     userFlow[userId].payment = method;
 
-    const details = method === "BSP"
-      ? "Account#: 0001196222"
-      : "Number: 74703925";
+    const details =
+      method === "BSP"
+        ? "Account#: 0001196222"
+        : "Number: 74703925";
 
     return bot.sendMessage(chatId, `Send receipt after payment:\n\n${details}`);
   }
+
+  // ================= ADMIN APPROVE =================
+  if (data.startsWith("approve_")) {
+    if (!isAdmin(userId)) return;
+
+    const targetUserId = data.split("_")[1];
+
+    const bookingDoc = await db.collection("bookings").doc(targetUserId).get();
+    const booking = bookingDoc.data();
+
+    if (!booking) return;
+
+    await db.collection("bookings").doc(targetUserId).update({
+      status: "active",
+      expiresAt: booking.expiresAt
+    });
+
+    bot.sendMessage(targetUserId, "✅ Approved! Session active.");
+    bot.sendMessage(chatId, "Approved");
+  }
+
+  // ================= ADMIN REJECT =================
+  if (data.startsWith("reject_")) {
+    if (!isAdmin(userId)) return;
+
+    const targetUserId = data.split("_")[1];
+
+    await db.collection("bookings").doc(targetUserId).update({
+      status: "rejected"
+    });
+
+    bot.sendMessage(targetUserId, "❌ Rejected.");
+    bot.sendMessage(chatId, "Rejected");
+  }
 });
 
-// ================= RECEIPT =================
+// ================= RECEIPT HANDLER =================
 bot.on("message", async (msg) => {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
@@ -249,48 +302,14 @@ bot.on("message", async (msg) => {
       }
     });
 
-    // forward to channel
+    // send to channel
     try {
       await bot.sendPhoto(CHANNEL, fileId, { caption });
     } catch (e) {}
 
-    bot.sendMessage(chatId, "Receipt received. Please wait for admin approval.");
+    bot.sendMessage(chatId, "Receipt received. Await admin approval.");
 
     delete userFlow[userId];
-  }
-});
-
-// ================= APPROVAL =================
-bot.on("callback_query", async (q) => {
-  const data = q.data;
-  const adminId = q.from.id;
-
-  if (!isAdmin(adminId)) return;
-
-  if (data.startsWith("approve_")) {
-    const userId = data.split("_")[1];
-
-    const booking = await db.collection("bookings").doc(userId).get();
-    const d = booking.data();
-
-    const expiresAt = d.expiresAt;
-
-    await db.collection("bookings").doc(userId).update({
-      status: "active",
-      expiresAt
-    });
-
-    bot.sendMessage(userId, "✅ Approved! Your session is now active.");
-  }
-
-  if (data.startsWith("reject_")) {
-    const userId = data.split("_")[1];
-
-    await db.collection("bookings").doc(userId).update({
-      status: "rejected"
-    });
-
-    bot.sendMessage(userId, "❌ Your request was rejected.");
   }
 });
 
@@ -308,10 +327,10 @@ setInterval(async () => {
 
       if (d.expiresAt && now > d.expiresAt) {
         await doc.ref.update({ status: "expired" });
-        bot.sendMessage(d.userId, "⏳ Your session has expired.");
+        bot.sendMessage(d.userId, "⏳ Session expired.");
       }
     });
   } catch (err) {
-    console.error("Expiry check error:", err);
+    console.error(err);
   }
 }, 60000);
