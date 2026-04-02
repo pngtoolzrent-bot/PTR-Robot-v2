@@ -1,34 +1,45 @@
 const TelegramBot = require("node-telegram-bot-api");
 const admin = require("firebase-admin");
-const serviceAccount = require("./serviceAccountKey.json");
 
+// ================= ENV SETUP =================
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(
+    JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  )
 });
 
 const db = admin.firestore();
 
-const ADMIN_ID = "8155108761";
+// ================= CONFIG =================
+const ADMIN_ID = process.env.ADMIN_ID;
 
+// ================= STATE =================
 const pendingInputs = {};
 const userStates = {};
 
-// -------------------- START --------------------
+// ================= START =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
 
-  await bot.sendMessage(chatId,
-`👋 Welcome to *PNGToolzRent*
+  await db.collection("users").doc(String(msg.from.id)).set({
+    id: msg.from.id,
+    firstName: msg.from.first_name,
+    username: msg.from.username || null,
+    joinedAt: Date.now()
+  }, { merge: true });
 
-We provide secure tool rental services for Unlocking and more.
+  bot.sendMessage(chatId,
+`👋 Welcome to PNGToolzRent
 
-💰 Price: K10 for 6 Hours
-⚡ Instant activation after approval
+💰 K10 for 6 Hours per tool
+⚡ Fast approval system
+🔒 Secure tool rental platform
 
-Please choose an option below:`, {
-    parse_mode: "Markdown",
+We appreciate you choosing our service.
+
+Select an option below:`, {
     reply_markup: {
       inline_keyboard: [
         [{ text: "🛠 Rent Tool", callback_data: "rent_tool" }],
@@ -39,13 +50,13 @@ Please choose an option below:`, {
   });
 });
 
-// -------------------- CALLBACK HANDLER --------------------
+// ================= CALLBACKS =================
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
   const data = query.data;
 
-  // ---------------- ADMIN PANEL ----------------
+  // ================= ADMIN PANEL =================
   if (data === "admin_panel" && userId == ADMIN_ID) {
     bot.sendMessage(chatId, "⚙️ Admin Panel", {
       reply_markup: {
@@ -61,32 +72,30 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // ---------------- VIEW TOOLS ----------------
+  // ================= TOOLS =================
   if (data === "admin_tools" && userId == ADMIN_ID) {
     const snapshot = await db.collection("tools").get();
 
     let text = "🛠 Tools:\n\n";
     snapshot.forEach(doc => {
       const t = doc.data();
-      text += `${doc.id} → ${t.name} (${t.active ? "Active" : "Disabled"})\n`;
+      text += `${doc.id} → ${t.name}\n`;
     });
 
     bot.sendMessage(chatId, text || "No tools found.");
   }
 
-  // ---------------- ADD TOOL ----------------
   if (data === "admin_addtool" && userId == ADMIN_ID) {
     pendingInputs[userId] = "add_tool";
     bot.sendMessage(chatId, "Send tool name (e.g. UnlockTool)");
   }
 
-  // ---------------- REMOVE TOOL ----------------
   if (data === "admin_removetool" && userId == ADMIN_ID) {
     pendingInputs[userId] = "remove_tool";
     bot.sendMessage(chatId, "Send tool ID to remove");
   }
 
-  // ---------------- VIEW CUSTOMERS ----------------
+  // ================= CUSTOMERS =================
   if (data === "admin_customers" && userId == ADMIN_ID) {
     const snapshot = await db.collection("users").get();
 
@@ -98,7 +107,7 @@ bot.on("callback_query", async (query) => {
     bot.sendMessage(chatId, text || "No customers.");
   }
 
-  // ---------------- ACTIVE SESSIONS ----------------
+  // ================= ACTIVE SESSIONS =================
   if (data === "admin_active" && userId == ADMIN_ID) {
     const snapshot = await db.collection("bookings")
       .where("status", "==", "active")
@@ -120,7 +129,7 @@ bot.on("callback_query", async (query) => {
     bot.sendMessage(chatId, text || "No active sessions.");
   }
 
-  // ---------------- RENEW / RENT ----------------
+  // ================= RENT TOOL =================
   if (data === "rent_tool") {
     const toolsSnap = await db.collection("tools").get();
 
@@ -128,9 +137,7 @@ bot.on("callback_query", async (query) => {
 
     toolsSnap.forEach(doc => {
       const t = doc.data();
-      if (t.active) {
-        buttons.push([{ text: t.name, callback_data: `select_tool_${doc.id}` }]);
-      }
+      buttons.push([{ text: t.name, callback_data: `select_tool_${doc.id}` }]);
     });
 
     bot.sendMessage(chatId, "🛠 Select a tool:", {
@@ -151,32 +158,33 @@ bot.on("callback_query", async (query) => {
     });
 
     bot.sendMessage(chatId,
-`💰 Please pay K10 for 6 Hours
+`💰 Payment Required
 
-📤 After payment, send your receipt here.`);
+K10 for 6 Hours
+
+Please send your receipt after payment.
+
+We appreciate you using PNGToolzRent.`);
 
     userStates[userId] = "waiting_receipt";
   }
 
-  // ---------------- APPROVE ----------------
+  // ================= APPROVE =================
   if (data.startsWith("approve_") && userId == ADMIN_ID) {
     const targetUser = data.split("_")[1];
 
-    const bookingRef = db.collection("bookings").doc(targetUser);
-
     const expiresAt = Date.now() + (6 * 60 * 60 * 1000);
 
-    await bookingRef.update({
+    await db.collection("bookings").doc(targetUser).update({
       status: "active",
       expiresAt: expiresAt
     });
 
-    bot.sendMessage(targetUser, "✅ Your payment is approved. Tool activated for 6 hours.");
-
+    bot.sendMessage(targetUser, "✅ Approved! Your tool is now active for 6 hours.");
     bot.sendMessage(chatId, "Approved.");
   }
 
-  // ---------------- REJECT ----------------
+  // ================= REJECT =================
   if (data.startsWith("reject_") && userId == ADMIN_ID) {
     const targetUser = data.split("_")[1];
 
@@ -184,16 +192,17 @@ bot.on("callback_query", async (query) => {
       status: "rejected"
     });
 
-    bot.sendMessage(targetUser, "❌ Your payment was rejected.");
+    bot.sendMessage(targetUser, "❌ Payment rejected.");
     bot.sendMessage(chatId, "Rejected.");
   }
 });
 
-// ---------------- MESSAGE HANDLER ----------------
+// ================= MESSAGE HANDLER =================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
+  // ---------- ADMIN INPUT ----------
   if (userId == ADMIN_ID && pendingInputs[userId]) {
     const action = pendingInputs[userId];
 
@@ -201,28 +210,25 @@ bot.on("message", async (msg) => {
       const id = msg.text.toLowerCase();
 
       await db.collection("tools").doc(id).set({
-        name: msg.text,
-        active: true
+        name: msg.text
       });
 
       bot.sendMessage(chatId, "✅ Tool added");
       delete pendingInputs[userId];
+      return;
     }
 
     if (action === "remove_tool") {
       await db.collection("tools").doc(msg.text).delete();
       bot.sendMessage(chatId, "❌ Tool removed");
       delete pendingInputs[userId];
+      return;
     }
-
-    return;
   }
 
-  // ---------------- RECEIPT HANDLING ----------------
+  // ---------- RECEIPT HANDLING ----------
   if (msg.photo) {
-    const userState = userStates[userId];
-
-    if (userState === "waiting_receipt") {
+    if (userStates[userId] === "waiting_receipt") {
       const fileId = msg.photo[msg.photo.length - 1].file_id;
 
       const booking = await db.collection("bookings").doc(String(userId)).get();
@@ -252,14 +258,14 @@ Slot: ${data.slot}`;
         caption
       });
 
-      bot.sendMessage(chatId, "📩 Receipt received. Waiting for approval.");
+      bot.sendMessage(chatId, "📩 Receipt received. Awaiting approval.");
 
       userStates[userId] = null;
     }
   }
 });
 
-// ---------------- TIMER CHECKER ----------------
+// ================= TIMER SYSTEM =================
 setInterval(async () => {
   const snapshot = await db.collection("bookings")
     .where("status", "==", "active")
