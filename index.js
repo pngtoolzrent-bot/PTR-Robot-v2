@@ -1,7 +1,11 @@
 const TelegramBot = require("node-telegram-bot-api");
 const admin = require("firebase-admin");
 
-// ================= ENV SETUP =================
+// ================= ENV =================
+if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing");
+if (!process.env.ADMIN_ID) throw new Error("ADMIN_ID missing");
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error("FIREBASE_SERVICE_ACCOUNT missing");
+
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 admin.initializeApp({
@@ -12,132 +16,139 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// ================= CONFIG =================
 const ADMIN_ID = process.env.ADMIN_ID;
 
 // ================= STATE =================
-const pendingInputs = {};
 const userStates = {};
+const pendingInputs = {};
 
 // ================= START =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-  await db.collection("users").doc(String(msg.from.id)).set({
-    id: msg.from.id,
-    firstName: msg.from.first_name,
+  await db.collection("users").doc(String(userId)).set({
+    id: userId,
     username: msg.from.username || null,
+    firstName: msg.from.first_name || null,
+    lastName: msg.from.last_name || null,
     joinedAt: Date.now()
   }, { merge: true });
 
   bot.sendMessage(chatId,
 `👋 Welcome to PNGToolzRent
 
-💰 K10 for 6 Hours per tool
-⚡ Fast approval system
-🔒 Secure tool rental platform
-
-We appreciate you choosing our service.
-
-Select an option below:`, {
+💰 K10 for 6 Hours
+⚡ Fast & secure service
+🙏 Thank you for choosing us`, {
     reply_markup: {
       inline_keyboard: [
         [{ text: "🛠 Rent Tool", callback_data: "rent_tool" }],
         [{ text: "📊 My Status", callback_data: "my_status" }],
-        ...(msg.from.id == ADMIN_ID ? [[{ text: "⚙️ Admin Panel", callback_data: "admin_panel" }]] : [])
+        ...(String(userId) === String(ADMIN_ID)
+          ? [[{ text: "⚙️ Admin Panel", callback_data: "admin_panel" }]]
+          : [])
       ]
     }
   });
 });
 
-// ================= CALLBACKS =================
+// ================= CALLBACK =================
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
   const data = query.data;
 
-  // ================= ADMIN PANEL =================
-  if (data === "admin_panel" && userId == ADMIN_ID) {
+  const isAdmin = String(userId) === String(ADMIN_ID);
+
+  // ===== ADMIN PANEL =====
+  if (data === "admin_panel" && isAdmin) {
     bot.sendMessage(chatId, "⚙️ Admin Panel", {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "📊 View Slots", callback_data: "admin_slots" }],
-          [{ text: "👥 View Customers", callback_data: "admin_customers" }],
-          [{ text: "⏳ Active Sessions", callback_data: "admin_active" }],
-          [{ text: "🛠 View Tools", callback_data: "admin_tools" }],
+          [{ text: "🛠 Tools", callback_data: "admin_tools" }],
           [{ text: "➕ Add Tool", callback_data: "admin_addtool" }],
-          [{ text: "❌ Remove Tool", callback_data: "admin_removetool" }]
+          [{ text: "❌ Remove Tool", callback_data: "admin_removetool" }],
+          [{ text: "👥 Customers", callback_data: "admin_customers" }],
+          [{ text: "⏳ Active Sessions", callback_data: "admin_active" }]
         ]
       }
     });
   }
 
-  // ================= TOOLS =================
-  if (data === "admin_tools" && userId == ADMIN_ID) {
-    const snapshot = await db.collection("tools").get();
+  // ===== TOOLS =====
+  if (data === "admin_tools" && isAdmin) {
+    const snap = await db.collection("tools").get();
 
     let text = "🛠 Tools:\n\n";
-    snapshot.forEach(doc => {
-      const t = doc.data();
-      text += `${doc.id} → ${t.name}\n`;
+    snap.forEach(doc => {
+      text += `${doc.id} → ${doc.data().name}\n`;
     });
 
-    bot.sendMessage(chatId, text || "No tools found.");
+    bot.sendMessage(chatId, text || "No tools.");
   }
 
-  if (data === "admin_addtool" && userId == ADMIN_ID) {
+  if (data === "admin_addtool" && isAdmin) {
     pendingInputs[userId] = "add_tool";
-    bot.sendMessage(chatId, "Send tool name (e.g. UnlockTool)");
+    bot.sendMessage(chatId, "Send tool name:");
   }
 
-  if (data === "admin_removetool" && userId == ADMIN_ID) {
+  if (data === "admin_removetool" && isAdmin) {
     pendingInputs[userId] = "remove_tool";
-    bot.sendMessage(chatId, "Send tool ID to remove");
+    bot.sendMessage(chatId, "Send tool ID to remove:");
   }
 
-  // ================= CUSTOMERS =================
-  if (data === "admin_customers" && userId == ADMIN_ID) {
-    const snapshot = await db.collection("users").get();
+  // ===== CUSTOMERS =====
+  if (data === "admin_customers" && isAdmin) {
+    const snap = await db.collection("users").get();
 
     let text = "👥 Customers:\n\n";
-    snapshot.forEach(doc => {
-      text += `${doc.id}\n`;
+
+    snap.forEach(doc => {
+      const d = doc.data();
+
+      const username = d.username
+        ? `@${d.username}`
+        : d.firstName || "NoUsername";
+
+      text += `👤 ${username}\n🆔 ${doc.id}\n\n`;
     });
 
     bot.sendMessage(chatId, text || "No customers.");
   }
 
-  // ================= ACTIVE SESSIONS =================
-  if (data === "admin_active" && userId == ADMIN_ID) {
-    const snapshot = await db.collection("bookings")
+  // ===== ACTIVE SESSIONS =====
+  if (data === "admin_active" && isAdmin) {
+    const snap = await db.collection("bookings")
       .where("status", "==", "active")
       .get();
 
     const now = Date.now();
     let text = "⏳ Active Sessions:\n\n";
 
-    snapshot.forEach(doc => {
+    snap.forEach(doc => {
       const d = doc.data();
       const remaining = d.expiresAt - now;
 
-      const hours = Math.floor(remaining / (1000 * 60 * 60));
-      const minutes = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+      const h = Math.floor(remaining / (1000 * 60 * 60));
+      const m = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
 
-      text += `User: ${doc.id}\nTool: ${d.tool}\nRemaining: ${hours}h ${minutes}m\n\n`;
+      text += `User: ${doc.id}\nTool: ${d.tool}\nRemaining: ${h}h ${m}m\n\n`;
     });
 
     bot.sendMessage(chatId, text || "No active sessions.");
   }
 
-  // ================= RENT TOOL =================
+  // ===== RENT TOOL =====
   if (data === "rent_tool") {
     const toolsSnap = await db.collection("tools").get();
 
     let buttons = [];
 
     toolsSnap.forEach(doc => {
-      const t = doc.data();
-      buttons.push([{ text: t.name, callback_data: `select_tool_${doc.id}` }]);
+      buttons.push([
+        { text: doc.data().name, callback_data: `select_tool_${doc.id}` }
+      ]);
     });
 
     bot.sendMessage(chatId, "🛠 Select a tool:", {
@@ -148,51 +159,40 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("select_tool_")) {
     const toolId = data.replace("select_tool_", "");
 
-    const slot = `slot_${Date.now()}`;
-
     await db.collection("bookings").doc(String(userId)).set({
       tool: toolId,
-      slot: slot,
       status: "pending",
       createdAt: Date.now()
     });
 
-    bot.sendMessage(chatId,
-`💰 Payment Required
+    userStates[userId] = "waiting_receipt";
 
-K10 for 6 Hours
+    bot.sendMessage(chatId,
+`💰 Payment: K10 for 6 Hours
 
 Please send your receipt after payment.
 
-We appreciate you using PNGToolzRent.`);
-
-    userStates[userId] = "waiting_receipt";
+🙏 Thank you for choosing PNGToolzRent`);
   }
 
-  // ================= APPROVE =================
-  if (data.startsWith("approve_") && userId == ADMIN_ID) {
+  // ===== APPROVE =====
+  if (data.startsWith("approve_") && isAdmin) {
     const targetUser = data.split("_")[1];
 
-    const expiresAt = Date.now() + (6 * 60 * 60 * 1000);
+    pendingInputs[userId] = `login_${targetUser}`;
 
-    await db.collection("bookings").doc(targetUser).update({
-      status: "active",
-      expiresAt: expiresAt
-    });
-
-    bot.sendMessage(targetUser, "✅ Approved! Your tool is now active for 6 hours.");
-    bot.sendMessage(chatId, "Approved.");
+    bot.sendMessage(chatId, "✍️ Send login details for this user:");
   }
 
-  // ================= REJECT =================
-  if (data.startsWith("reject_") && userId == ADMIN_ID) {
+  // ===== REJECT =====
+  if (data.startsWith("reject_") && isAdmin) {
     const targetUser = data.split("_")[1];
 
     await db.collection("bookings").doc(targetUser).update({
       status: "rejected"
     });
 
-    bot.sendMessage(targetUser, "❌ Payment rejected.");
+    bot.sendMessage(targetUser, "❌ Your payment was rejected.");
     bot.sendMessage(chatId, "Rejected.");
   }
 });
@@ -202,10 +202,13 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // ---------- ADMIN INPUT ----------
-  if (userId == ADMIN_ID && pendingInputs[userId]) {
+  const isAdmin = String(userId) === String(ADMIN_ID);
+
+  // ===== ADMIN INPUT =====
+  if (isAdmin && pendingInputs[userId]) {
     const action = pendingInputs[userId];
 
+    // ADD TOOL
     if (action === "add_tool") {
       const id = msg.text.toLowerCase();
 
@@ -218,70 +221,119 @@ bot.on("message", async (msg) => {
       return;
     }
 
+    // REMOVE TOOL
     if (action === "remove_tool") {
       await db.collection("tools").doc(msg.text).delete();
+
       bot.sendMessage(chatId, "❌ Tool removed");
+      delete pendingInputs[userId];
+      return;
+    }
+
+    // LOGIN DETAILS AFTER APPROVAL
+    if (action.startsWith("login_")) {
+      const targetUser = action.split("_")[1];
+
+      const bookingDoc = await db.collection("bookings").doc(targetUser).get();
+      const data = bookingDoc.data();
+
+      const loginDetails = msg.text;
+
+      const expiresAt = Date.now() + (6 * 60 * 60 * 1000);
+
+      await db.collection("bookings").doc(targetUser).update({
+        status: "active",
+        loginDetails,
+        expiresAt
+      });
+
+      // Send to user
+      bot.sendMessage(targetUser,
+`✅ Approved!
+
+🔐 Login Details:
+${loginDetails}
+
+⏳ Duration: 6 Hours
+🙏 Thank you for choosing PNGToolzRent`);
+
+      // Log to channel
+      try {
+        await bot.sendMessage("@ptr_records",
+`✅ APPROVED
+
+User: ${targetUser}
+Tool: ${data.tool}
+Status: Active
+Duration: 6 Hours`);
+      } catch (e) {
+        console.error("Channel log failed:", e.message);
+      }
+
+      bot.sendMessage(chatId, "✅ Login sent and session activated.");
+
       delete pendingInputs[userId];
       return;
     }
   }
 
-  // ---------- RECEIPT HANDLING ----------
-  if (msg.photo) {
-    if (userStates[userId] === "waiting_receipt") {
-      const fileId = msg.photo[msg.photo.length - 1].file_id;
+  // ===== RECEIPT HANDLING =====
+  if (msg.photo && userStates[userId] === "waiting_receipt") {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
 
-      const booking = await db.collection("bookings").doc(String(userId)).get();
-      const data = booking.data();
+    const booking = await db.collection("bookings").doc(String(userId)).get();
+    const data = booking.data();
 
-      const caption = `📥 Receipt
+    const caption = `📥 RECEIPT
 
 User: ${userId}
+Username: @${msg.from.username || "N/A"}
 Tool: ${data.tool}
-Slot: ${data.slot}`;
+Status: Pending`;
 
-      // Send to admin
-      bot.sendPhoto(ADMIN_ID, fileId, {
-        caption,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "✅ Approve", callback_data: `approve_${userId}` },
-              { text: "❌ Reject", callback_data: `reject_${userId}` }
-            ]
+    // Admin
+    bot.sendPhoto(ADMIN_ID, fileId, {
+      caption,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Approve", callback_data: `approve_${userId}` },
+            { text: "❌ Reject", callback_data: `reject_${userId}` }
           ]
-        }
-      });
+        ]
+      }
+    });
 
-      // Forward to record channel
-      bot.sendPhoto("@ptr_records", fileId, {
-        caption
-      });
-
-      bot.sendMessage(chatId, "📩 Receipt received. Awaiting approval.");
-
-      userStates[userId] = null;
+    // Channel
+    try {
+      await bot.sendPhoto("@ptr_records", fileId, { caption });
+    } catch (e) {
+      console.error("Channel forward failed:", e.message);
     }
+
+    bot.sendMessage(chatId, "📩 Receipt received. Awaiting approval.");
+
+    userStates[userId] = null;
   }
 });
 
-// ================= TIMER SYSTEM =================
+// ================= EXPIRY TIMER =================
 setInterval(async () => {
-  const snapshot = await db.collection("bookings")
+  const snap = await db.collection("bookings")
     .where("status", "==", "active")
     .get();
 
   const now = Date.now();
 
-  snapshot.forEach(async (doc) => {
-    const data = doc.data();
+  snap.forEach(async (doc) => {
+    const d = doc.data();
 
-    if (data.expiresAt && now > data.expiresAt) {
+    if (d.expiresAt && now > d.expiresAt) {
       await db.collection("bookings").doc(doc.id).update({
         status: "expired"
       });
 
-      bot.sendMessage(doc.id, "⏰ Your tool session has expired.");
+      bot.sendMessage(doc.id, "⏰ Your session has expired.");
     }
   });
 }, 60000);
