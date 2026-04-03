@@ -5,21 +5,35 @@ const admin = require("firebase-admin");
 // ================= EXPRESS =================
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("Running"));
-app.listen(PORT);
 
-// ================= ENV =================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = String(process.env.ADMIN_ID);
-const SERVICE = process.env.FIREBASE_SERVICE_ACCOUNT;
+app.get("/", (req, res) => res.send("Bot Running"));
+app.listen(PORT, () => console.log("Server running on port", PORT));
 
-if (!BOT_TOKEN || !ADMIN_ID || !SERVICE) throw new Error("Missing ENV");
+// ================= ENV (SAFE) =================
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const ADMIN_ID = process.env.ADMIN_ID || "";
+const SERVICE = process.env.FIREBASE_SERVICE_ACCOUNT || "";
 
-// ================= FIREBASE =================
-admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(SERVICE))
-});
-const db = admin.firestore();
+if (!BOT_TOKEN) console.error("❌ BOT_TOKEN missing");
+if (!ADMIN_ID) console.error("❌ ADMIN_ID missing");
+if (!SERVICE) console.error("❌ FIREBASE_SERVICE_ACCOUNT missing");
+
+// ================= FIREBASE INIT (SAFE) =================
+let db;
+
+try {
+  const serviceAccount = JSON.parse(SERVICE);
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+
+  db = admin.firestore();
+  console.log("✅ Firebase initialized");
+
+} catch (err) {
+  console.error("🔥 Firebase init error:", err.message);
+}
 
 // ================= BOT =================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -28,31 +42,41 @@ const CHANNEL = "@ptr_records";
 const TOOL_ID = "unlocktool";
 
 // ================= HELPERS =================
-const isAdmin = (id) => String(id) === ADMIN_ID;
+const isAdmin = (id) => String(id) === String(ADMIN_ID);
 
-// ================= INIT (SELF HEALING) =================
+// ================= SELF-HEAL DB =================
 async function ensureDB() {
-  const toolRef = db.collection("tools").doc(TOOL_ID);
-  const tool = await toolRef.get();
+  if (!db) return;
 
-  if (!tool.exists) {
-    await toolRef.set({ name: "UnlockTool" });
-  }
+  try {
+    const toolRef = db.collection("tools").doc(TOOL_ID);
+    const tool = await toolRef.get();
 
-  const slotsRef = db.collection("slots");
-  const snap = await slotsRef.get();
-
-  if (snap.empty) {
-    console.log("Creating slots...");
-    for (let i = 1; i <= 5; i++) {
-      await slotsRef.doc(`slot${i}`).set({
-        toolId: TOOL_ID,
-        userId: null,
-        expiresAt: null
-      });
+    if (!tool.exists) {
+      await toolRef.set({ name: "UnlockTool" });
+      console.log("Tool created");
     }
+
+    const slotsRef = db.collection("slots");
+    const snap = await slotsRef.get();
+
+    if (snap.empty) {
+      console.log("Creating slots...");
+      for (let i = 1; i <= 5; i++) {
+        await slotsRef.doc(`slot${i}`).set({
+          toolId: TOOL_ID,
+          userId: null,
+          expiresAt: null
+        });
+      }
+      console.log("Slots created");
+    }
+
+  } catch (err) {
+    console.error("DB init error:", err.message);
   }
 }
+
 ensureDB();
 
 // ================= SLOT LOGIC =================
@@ -94,7 +118,10 @@ bot.onText(/\/start/, async (msg) => {
 bot.on("callback_query", async (q) => {
   const id = q.from.id;
   const data = q.data;
+
   bot.answerCallbackQuery(q.id);
+
+  if (!db) return bot.sendMessage(id, "System not ready.");
 
   // ===== RENT =====
   if (data === "rent") {
@@ -180,7 +207,10 @@ bot.on("callback_query", async (q) => {
   if (data.startsWith("approve_") && isAdmin(id)) {
     const uid = data.split("_")[1];
 
-    const req = (await db.collection("requests").doc(uid).get()).data();
+    const reqDoc = await db.collection("requests").doc(uid).get();
+    if (!reqDoc.exists) return;
+
+    const req = reqDoc.data();
 
     const expiresAt = Date.now() + (req.rate * 3600000);
 
@@ -192,6 +222,7 @@ bot.on("callback_query", async (q) => {
     await db.collection("requests").doc(uid).update({ status: "approved" });
 
     bot.sendMessage(uid, "✅ Approved. Admin will send login.");
+    bot.sendMessage(id, "Approved.");
   }
 
   // ===== REJECT =====
@@ -206,16 +237,16 @@ bot.on("callback_query", async (q) => {
 
 // ================= RECEIPTS =================
 bot.on("message", async (msg) => {
-  if (!msg.photo) return;
+  if (!msg.photo || !db) return;
 
   const id = msg.from.id;
 
   const reqDoc = await db.collection("requests").doc(String(id)).get();
   if (!reqDoc.exists) return;
 
-  const req = reqDoc.data();
   const fileId = msg.photo.pop().file_id;
 
+  // Send to admin
   bot.sendPhoto(ADMIN_ID, fileId, {
     caption: `User: ${id}`,
     reply_markup: {
@@ -226,17 +257,22 @@ bot.on("message", async (msg) => {
     }
   });
 
+  // Send to records channel
   try {
     await bot.sendPhoto(CHANNEL, fileId, {
       caption: `User: ${id}\nStatus: pending`
     });
-  } catch {}
+  } catch (err) {
+    console.error("Channel send failed:", err.message);
+  }
 
-  bot.sendMessage(id, "📩 Receipt sent. Await approval.");
+  bot.sendMessage(id, "📩 Receipt sent. Awaiting approval.");
 });
 
 // ================= AUTO EXPIRY =================
 setInterval(async () => {
+  if (!db) return;
+
   const snap = await db.collection("slots").get();
 
   snap.forEach(async doc => {
